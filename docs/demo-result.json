@@ -1,0 +1,28 @@
+{
+  "opening_stock": 10,
+  "order_total_cents": 14997,
+  "replay_same_order": true,
+  "after_sale": [
+    {
+      "product_id": 1,
+      "name": "Mechanical keyboard",
+      "actual_stock": 7,
+      "ledger_stock": 7,
+      "difference": 0
+    }
+  ],
+  "movement_deltas": [
+    10,
+    -3,
+    3
+  ],
+  "after_cancel": [
+    {
+      "product_id": 1,
+      "name": "Mechanical keyboard",
+      "actual_stock": 10,
+      "ledger_stock": 10,
+      "difference": 0
+    }
+  ]
+}

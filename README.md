@@ -1,6 +1,6 @@
 # OrderFlow — Inventory-aware Order API
 
-[![tests](https://github.com/boyhoanghoi/orderflow/actions/workflows/test.yml/badge.svg)](https://github.com/boyhoanghoi/orderflow/actions/workflows/test.yml)
+[Local verification](docs/verification.md) · [CI configuration](.github/workflows/test.yml)
 
 **Python backend portfolio: place orders, prevent duplicate checkout, reverse stock on cancellation, and reconcile every inventory change.**
 
@@ -69,7 +69,9 @@ Order request example: `{"items":[{"product_id":1,"quantity":2}]}`. Inspect comp
 
 ## Verification
 
-CI runs API tests on Python 3.12 and 3.13, then executes the isolated demo. Download the `api-evidence-*` artifact from an [Actions run](https://github.com/boyhoanghoi/orderflow/actions) for JUnit results and actual demo JSON. The badge reflects the latest run, not an invented pass count.
+Local verification on Windows with Python 3.12: **11 tests passed**, and the isolated demo completed successfully. See [verification details and actual demo output](docs/verification.md). Argon2 native bindings are pinned to the version used for this run.
+
+CI is configured for Python 3.12 and 3.13 with JUnit/demo artifacts. Hosted runs currently cannot start, so no successful hosted-CI result is claimed. Once a runner is available, download `api-evidence-*` from an [Actions run](https://github.com/boyhoanghoi/orderflow/actions).
 
 Tests exercise transaction rollback, idempotency, ownership, status transitions, rejected adjustments, ledger traceability, filtering and deliberate stock drift. See [acceptance mapping](docs/inventory-support.md).
 
