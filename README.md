@@ -1,57 +1,82 @@
-# OrderFlow API
+# OrderFlow — Inventory-aware Order API
 
-Backend cho quy trình đặt hàng, quản lý tồn kho và xử lý trạng thái đơn. Dự án dùng FastAPI, SQLAlchemy, SQLite cho demo, Argon2 để băm mật khẩu và JWT để xác thực.
+[Local verification](docs/verification.md) · [CI configuration](.github/workflows/test.yml)
 
-## Nghiệp vụ chính
+**Python backend portfolio: place orders, prevent duplicate checkout, reverse stock on cancellation, and reconcile every inventory change.**
 
-- Khách đăng ký/đăng nhập, xem và tìm sản phẩm, tạo và xem đơn của mình.
-- Quản trị viên thêm sản phẩm, điều chỉnh tồn kho và xác nhận giao hàng.
-- Mỗi lần đặt hàng trừ tồn kho có điều kiện trong cùng transaction. Nếu một sản phẩm hết hàng, toàn bộ đơn được rollback.
-- Header `Idempotency-Key` giúp gửi lại yêu cầu đặt hàng mà không tạo thêm đơn hoặc trừ kho lần hai.
-- Hủy đơn khi chưa giao sẽ hoàn tồn kho. Giá bán được lưu snapshot trong từng dòng đơn.
-- Phân trang, kiểm tra dữ liệu đầu vào, mã lỗi HTTP và OpenAPI tại `/docs`.
+FastAPI · SQLAlchemy · SQLite · JWT · Argon2 · Pytest · Docker
 
-## Chạy local
+[Tiếng Việt](README.vi.md) | [Design](docs/design.md) | [Inventory support](docs/inventory-support.md) | [Tests](tests/test_inventory.py)
 
-Yêu cầu Python 3.13. Trong thư mục dự án:
+## Start with a reproducible demo
+
+Python 3.12+:
 
 ```bash
+git clone https://github.com/boyhoanghoi/orderflow.git
+cd orderflow
 python -m venv .venv
-# Windows: .venv\Scripts\activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
 # macOS/Linux: source .venv/bin/activate
 pip install -r requirements-dev.txt
-cp .env.example .env  # Trên Windows dùng: copy .env.example .env
+python scripts/demo.py
+python -m pytest -q
 ```
 
-Sửa `JWT_SECRET`, `ADMIN_EMAIL`, `ADMIN_PASSWORD` trong `.env`, sau đó nạp biến môi trường hoặc dùng Docker Compose (`docker compose up --build`). Với shell local:
+The demo calls the real application with a temporary SQLite database and random temporary credentials. It creates 10 units, sells 3, replays the same request, then cancels. Output shows stock `10 → 7 → 10`, movement deltas `[10, -3, 3]`, and reconciliation difference `0`. No deployed service or existing database is used.
+
+## Why these details matter
+
+| Failure case | Implemented behavior |
+| --- | --- |
+| A checkout request is retried | Same user + key + items returns the original order; changed items return 409 |
+| One of several products is unavailable | Roll back the complete order, stock updates and movement rows |
+| A customer cancels twice | Only a placed order can transition; stock is restored once |
+| Product prices later change | Order lines retain the product name and integer price snapshot |
+| Support needs to explain stock | Admin can inspect movements and compare actual vs ledger stock |
+| Another customer guesses an order ID | Order details and cancellation check ownership; unauthorized access returns 404 |
+
+```mermaid
+flowchart LR
+    A[HTTP request] --> B[Validation and JWT role check]
+    B --> C[Order and inventory transaction]
+    C --> D[(Products and orders)]
+    C --> E[(Stock movement ledger)]
+    D --> F[Admin reconciliation]
+    E --> F
+```
+
+## Run the interactive API
+
+Copy `.env.example` to `.env` (`Copy-Item .env.example .env` on PowerShell). Replace `JWT_SECRET` with a random value of at least 32 characters, and choose local admin credentials. Then:
 
 ```bash
 uvicorn app.main:app --reload --env-file .env
 ```
 
-Mở `http://127.0.0.1:8000/docs`. Dữ liệu demo được lưu vào file SQLite. Không dùng khóa bí mật mẫu khi triển khai thực tế.
+Open [Swagger UI](http://127.0.0.1:8000/docs). Alternatively use `docker compose up --build` with the same `.env`. Obtain a token with `POST /auth/login`; enter it in Swagger's **Authorize** control. Register a separate customer for checkout. Send an `Idempotency-Key` of 8-128 characters when placing an order.
 
-## Thử API
+| API | Access |
+| --- | --- |
+| POST `/auth/register`, `/auth/login`; GET `/products`, `/health` | Public |
+| POST `/products`; PATCH `/products/{id}/stock` | Admin |
+| POST `/orders`; GET `/orders` | Authenticated user; list is own orders |
+| GET `/orders/{id}`; POST `/orders/{id}/cancel` | Owner or admin |
+| POST `/orders/{id}/ship` | Admin |
+| GET `/inventory/movements`; GET `/inventory/reconciliation` | Admin, paginated |
 
-1. `POST /auth/login` với tài khoản admin trong `.env` để lấy token.
-2. `POST /products` tạo sản phẩm, gửi `Authorization: Bearer <token>`.
-3. `POST /auth/register` tạo khách; `POST /auth/login` lấy token khách.
-4. `POST /orders`, gửi token khách và `Idempotency-Key: checkout-001`:
+Order request example: `{"items":[{"product_id":1,"quantity":2}]}`. Inspect complete schemas and status codes in `/openapi.json`.
 
-```json
-{"items": [{"product_id": 1, "quantity": 2}]}
-```
+## Verification
 
-5. Gửi lại cùng key để thấy `id` không đổi. `POST /orders/1/cancel` để hoàn tồn kho.
+Local verification on Windows with Python 3.12: **11 tests passed**, and the isolated demo completed successfully. See [verification details and actual demo output](docs/verification.md). Argon2 native bindings are pinned to the version used for this run.
 
-## Kiểm thử
+CI is configured for Python 3.12 and 3.13 with JUnit/demo artifacts. Hosted runs currently cannot start, so no successful hosted-CI result is claimed. Once a runner is available, download `api-evidence-*` from an [Actions run](https://github.com/boyhoanghoi/orderflow/actions).
 
-```bash
-pytest -q
-```
+Tests exercise transaction rollback, idempotency, ownership, status transitions, rejected adjustments, ledger traceability, filtering and deliberate stock drift. See [acceptance mapping](docs/inventory-support.md).
 
-Test bao phủ đặt đơn, gửi lại request, hết hàng và rollback, hoàn kho, giao hàng, phân quyền và truy cập chéo tài khoản. Mỗi test dùng database SQLite riêng.
+## Scope
 
-## Giới hạn bản demo
+Personal learning project for internship applications. This is a small sales/inventory module, not a complete ERP or a production deployment. SQLite is for demonstration; PostgreSQL concurrency tests, schema migrations, rate limiting and operations work remain future improvements. Existing pre-1.1 demo databases need a deliberate ledger baseline; see [upgrade notes](docs/inventory-support.md#existing-demo-databases).
 
-`create_all` chỉ tạo schema ban đầu; khi triển khai lâu dài cần migration. SQLite phù hợp demo một tiến trình; tải ghi đồng thời lớn nên dùng PostgreSQL và thêm kiểm thử concurrency trên database đó. Chưa có thanh toán hay tích hợp hãng vận chuyển.
+For ERP master-data checks and support/UAT practice, see [ERP Support Toolkit](https://github.com/boyhoanghoi/erp-support-toolkit).

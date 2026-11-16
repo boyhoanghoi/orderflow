@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from sqlalchemy import (
-    ForeignKey, Integer, String, UniqueConstraint, create_engine, select, update
+    ForeignKey, Integer, String, UniqueConstraint, create_engine, func, select, update
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -77,6 +77,18 @@ class OrderItem(Base):
     quantity: Mapped[int] = mapped_column(Integer)
 
 
+class StockMovement(Base):
+    """Append-only application ledger, committed with its inventory mutation."""
+    __tablename__ = "stock_movements"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True)
+    actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    kind: Mapped[str] = mapped_column(String(20))
+    delta: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
+
+
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
@@ -135,6 +147,25 @@ class OrderOut(BaseModel):
     items: list[OrderLineOut]
 
 
+class MovementOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    product_id: int
+    order_id: int | None
+    actor_id: int
+    kind: Literal["opening", "adjustment", "sale", "cancellation"]
+    delta: int
+    created_at: datetime
+
+
+class ReconciliationOut(BaseModel):
+    product_id: int
+    name: str
+    actual_stock: int
+    ledger_stock: int
+    difference: int
+
+
 def get_db():
     with SessionLocal() as db:
         yield db
@@ -182,7 +213,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="OrderFlow API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="OrderFlow API", version="1.1.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -228,16 +259,18 @@ def list_products(
 
 
 @app.post("/products", response_model=ProductOut, status_code=201)
-def create_product(body: ProductIn, db: Annotated[Session, Depends(get_db)], _: Annotated[User, Depends(admin_user)]):
+def create_product(body: ProductIn, db: Annotated[Session, Depends(get_db)], actor: Annotated[User, Depends(admin_user)]):
     product = Product(**body.model_dump())
     db.add(product)
+    db.flush()
+    db.add(StockMovement(product_id=product.id, actor_id=actor.id, kind="opening", delta=product.stock))
     db.commit()
     db.refresh(product)
     return product
 
 
 @app.patch("/products/{product_id}/stock", response_model=ProductOut)
-def change_stock(product_id: int, body: StockIn, db: Annotated[Session, Depends(get_db)], _: Annotated[User, Depends(admin_user)]):
+def change_stock(product_id: int, body: StockIn, db: Annotated[Session, Depends(get_db)], actor: Annotated[User, Depends(admin_user)]):
     result = db.execute(
         update(Product).where(Product.id == product_id, Product.stock + body.delta >= 0)
         .values(stock=Product.stock + body.delta)
@@ -245,8 +278,42 @@ def change_stock(product_id: int, body: StockIn, db: Annotated[Session, Depends(
     if result.rowcount != 1:
         db.rollback()
         raise HTTPException(status_code=409, detail="Product missing or insufficient stock")
+    db.add(StockMovement(product_id=product_id, actor_id=actor.id, kind="adjustment", delta=body.delta))
     db.commit()
     return db.get(Product, product_id)
+
+
+@app.get("/inventory/movements", response_model=list[MovementOut])
+def movements(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[User, Depends(admin_user)],
+    product_id: int | None = Query(None, gt=0),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    stmt = select(StockMovement).order_by(StockMovement.id.desc())
+    if product_id is not None:
+        stmt = stmt.where(StockMovement.product_id == product_id)
+    return db.scalars(stmt.limit(limit).offset(offset)).all()
+
+
+@app.get("/inventory/reconciliation", response_model=list[ReconciliationOut])
+def reconciliation(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[User, Depends(admin_user)],
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    ledger = select(
+        StockMovement.product_id, func.sum(StockMovement.delta).label("balance")
+    ).group_by(StockMovement.product_id).subquery()
+    rows = db.execute(
+        select(Product, func.coalesce(ledger.c.balance, 0))
+        .outerjoin(ledger, Product.id == ledger.c.product_id)
+        .order_by(Product.id).limit(limit).offset(offset)
+    ).all()
+    return [dict(product_id=p.id, name=p.name, actual_stock=p.stock,
+                 ledger_stock=balance, difference=p.stock - balance) for p, balance in rows]
 
 
 @app.post("/orders", response_model=OrderOut, status_code=201)
@@ -288,6 +355,10 @@ def place_order(
     order = Order(user_id=user.id, idempotency_key=idempotency_key, request_hash=request_hash, total_cents=total, items=order_items)
     db.add(order)
     try:
+        db.flush()
+        for line in body.items:
+            db.add(StockMovement(product_id=line.product_id, order_id=order.id,
+                                 actor_id=user.id, kind="sale", delta=-line.quantity))
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -335,6 +406,8 @@ def cancel_order(order_id: int, db: Annotated[Session, Depends(get_db)], user: A
         raise HTTPException(status_code=409, detail="Only placed orders can be cancelled")
     for line in order.items:
         db.execute(update(Product).where(Product.id == line.product_id).values(stock=Product.stock + line.quantity))
+        db.add(StockMovement(product_id=line.product_id, order_id=order.id,
+                             actor_id=user.id, kind="cancellation", delta=line.quantity))
     db.commit()
     db.refresh(order)
     return order
